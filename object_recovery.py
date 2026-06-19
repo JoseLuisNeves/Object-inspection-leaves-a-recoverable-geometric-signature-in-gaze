@@ -1,30 +1,21 @@
 from __future__ import annotations
-import json
+import json, zlib
 from collections import Counter
 from math import log
 from pathlib import Path
 from typing import Any
-import zlib
 import numpy as np
 from reflacxloader import ReflacxLoader
 from stats_utils import paired_difference_stats
 from scipy.spatial import ConvexHull
 from matplotlib.path import Path as MplPath
 from alignment_emergence import fixation_arrays, duration_weighted_covariance
-RANDOM_SEED = 42
-N_FOLDS = 5
-MIN_FIXATIONS = 10
-OUT_DIR = Path("results/02_object_recovery")
-FOVEAL_PPD = 97.0
+RANDOM_SEED, N_FOLDS, MIN_FIXATIONS = 42, 5, 10; OUT_DIR = Path("results/02_object_recovery")
+FOVEAL_PPD, N_SIGMA, EIGENVALUE_FLOOR = 97.0, 2.0, 841.0
 FOVEAL_RADIUS_PX = 2.0 * FOVEAL_PPD
-N_SIGMA = 2.0
-EIGENVALUE_FLOOR = 841.0
 OUR_MODEL = {"g_parallel": 1.0, "g_perp": 0.4, "rho_gate": 2.0}
-G_PARALLEL = [0.70, 0.80, 0.90, 1.00]
-G_PERP = [0.30, 0.40, 0.50, 0.60, 0.70]
-TUNING_SAMPLE_PIXELS = 1000
-METHODS = ["our_model", "foveal_kde", "convex_hull"]
-METRICS = ["iou", "dice", "recall", "precision"]
+G_PARALLEL, G_PERP = [0.70, 0.80, 0.90, 1.00], [0.30, 0.40, 0.50, 0.60, 0.70]
+TUNING_SAMPLE_PIXELS, METHODS, METRICS = 1000, ["our_model", "foveal_kde", "convex_hull"], ["iou", "dice", "recall", "precision"]
 FOVEAL_RADIUS = int(np.ceil(FOVEAL_RADIUS_PX))
 _yy, _xx = np.mgrid[-FOVEAL_RADIUS:FOVEAL_RADIUS + 1, -FOVEAL_RADIUS:FOVEAL_RADIUS + 1]
 FOVEAL_DISK = (_xx**2 + _yy**2) <= FOVEAL_RADIUS_PX**2
@@ -77,10 +68,8 @@ def convex_hull_prediction(fixations: list[Any], crop: tuple[int, int, int, int]
     return mask, {"n_hull_points": int(len(points)), "hull_area_px": float(mask.sum())}
 def mask_metrics(prediction: np.ndarray, target: np.ndarray) -> dict[str, float]:
     intersection = float(np.logical_and(prediction, target).sum())
-    union = float(np.logical_or(prediction, target).sum())
-    pred_area = float(prediction.sum())
-    target_area = float(target.sum())
-    dice_denominator = pred_area + target_area
+    pred_area, target_area = float(prediction.sum()), float(target.sum())
+    union, dice_denominator = pred_area + target_area - intersection, pred_area + target_area
     return {"iou": intersection / union if union else 0.0, "dice": 2.0 * intersection / dice_denominator if dice_denominator else 0.0, "recall": intersection / target_area if target_area else 0.0, "precision": intersection / pred_area if pred_area else 0.0}
 def candidate_grid() -> list[dict[str, float]]:
     return [{"g_parallel": gp, "g_perp": gt, "rho_gate": OUR_MODEL["rho_gate"]} for gp in G_PARALLEL for gt in G_PERP if gt <= gp]
@@ -94,8 +83,7 @@ def build_episodes(loader: ReflacxLoader) -> list[dict[str, Any]]:
             inside = [fix for fix in fixations if ellipse.contains_point(fix.x, fix.y)]
             if len(inside) < MIN_FIXATIONS: continue
             crop = ellipse.crop(img_w, img_h)
-            positions, durations = fixation_arrays(inside)
-            centroid = np.average(positions, axis=0, weights=durations)
+            positions, durations = fixation_arrays(inside); centroid = np.average(positions, axis=0, weights=durations)
             eigenvals, eigenvecs = np.linalg.eigh(duration_weighted_covariance(inside))
             eigenvals = np.maximum(eigenvals, EIGENVALUE_FLOOR)
             episodes.append({"patient_id": patient_id, "study_id": study_id, "episode_key": f"{patient_id}/{study_id}/{annotation_index}", "annotation_index": int(annotation_index), "label": ellipse.labels[0] if ellipse.labels else None, "n_fix": int(len(inside)), "img_w": int(img_w), "img_h": int(img_h), "crop": crop, "ellipse_coords": [float(v) for v in ellipse.coords], "target": ellipse.mask(crop), "fixations": inside, "centroid": centroid, "eigenvals": eigenvals, "eigenvecs": eigenvecs, "scatter_ratio": float(eigenvals[1] / eigenvals[0])})
@@ -106,14 +94,8 @@ def evaluate_episode(episode: dict[str, Any], model: dict[str, float] | None = N
     if fold is not None: base["fold"] = int(fold)
     rows = []
     for method in methods:
-        if method == "our_model":
-            prediction, info = ourmodel_cloud(episode["fixations"], episode["crop"], model)
-        elif method == "foveal_kde":
-            prediction, info = fixation_heatmap_cloud(episode["fixations"], episode["crop"])
-        elif method == "convex_hull":
-            prediction, info = convex_hull_prediction(episode["fixations"], episode["crop"])
-        else:
-            raise ValueError(f"Unknown method: {method}")
+        if method not in METHODS: raise ValueError(f"Unknown method: {method}")
+        prediction, info = ourmodel_cloud(episode["fixations"], episode["crop"], model) if method == "our_model" else (fixation_heatmap_cloud if method == "foveal_kde" else convex_hull_prediction)(episode["fixations"], episode["crop"])
         rows.append({**base, "method": method, **mask_metrics(prediction, episode["target"]), **info})
     diagnostic = {**base, "img_w": episode["img_w"], "img_h": episode["img_h"], "crop": [int(v) for v in episode["crop"]], "ellipse_coords": episode["ellipse_coords"], "target_area_px": float(episode["target"].sum()), "method_metrics": {row["method"]: {k: row[k] for k in METRICS} for row in rows}}
     return rows, diagnostic
@@ -126,28 +108,21 @@ def make_patient_folds(episodes: list[dict[str, Any]], rng: np.random.Generator)
         train_patients = all_patients - test_patients
         if train_patients & test_patients: raise AssertionError("Patient leakage between train and test")
         seen |= test_patients
-        train_episodes = [ep for ep in episodes if str(ep["patient_id"]) in train_patients]
-        test_episodes = [ep for ep in episodes if str(ep["patient_id"]) in test_patients]
-        folds.append({"fold": int(fold_id), "train_patients": train_patients, "test_patients": test_patients, "train_episode_count": len(train_episodes), "test_episode_count": len(test_episodes)})
+        folds.append({"fold": int(fold_id), "train_patients": train_patients, "test_patients": test_patients, "train_episode_count": sum(str(ep["patient_id"]) in train_patients for ep in episodes), "test_episode_count": sum(str(ep["patient_id"]) in test_patients for ep in episodes)})
     if seen != all_patients: raise AssertionError("Every patient must appear in exactly one test fold")
     return folds
 def patient_mean_metric(rows: list[dict[str, Any]], method: str, metric: str) -> float:
     by_patient: dict[str, list[float]] = {}
     for row in rows:
-        if row["method"] == method:
-            by_patient.setdefault(str(row["patient_id"]), []).append(float(row[metric]))
+        if row["method"] == method: by_patient.setdefault(str(row["patient_id"]), []).append(float(row[metric]))
     return float(np.mean([np.mean(values) for values in by_patient.values()])) if by_patient else 0.0
 def sample_episode_pixels(episode: dict[str, Any]) -> dict[str, np.ndarray]:
     x0, y0, x1, y1 = episode["crop"]
     width, height = x1 - x0, y1 - y0
-    n_pixels = int(width * height)
-    n_sample = int(min(TUNING_SAMPLE_PIXELS, n_pixels))
+    n_pixels, n_sample = int(width * height), int(min(TUNING_SAMPLE_PIXELS, width * height))
     seed = (zlib.crc32(str(episode["episode_key"]).encode("utf-8")) + RANDOM_SEED) & 0xFFFFFFFF
-    rng = np.random.default_rng(seed)
-    flat = rng.integers(0, n_pixels, size=n_sample, endpoint=False)
-    xs = (flat % width + x0).astype(np.float64) + 0.5
-    ys = (flat // width + y0).astype(np.float64) + 0.5
-    return {"xs": xs, "ys": ys, "target": episode["target"].ravel()[flat]}
+    flat = np.random.default_rng(seed).integers(0, n_pixels, size=n_sample, endpoint=False)
+    return {"xs": (flat % width + x0).astype(np.float64) + 0.5, "ys": (flat // width + y0).astype(np.float64) + 0.5, "target": episode["target"].ravel()[flat]}
 def sampled_ourmodel_metrics(episode: dict[str, Any], model: dict[str, float], sample: dict[str, np.ndarray]) -> dict[str, float]:
     minor_variance, major_variance = float(episode["eigenvals"][0]), float(episode["eigenvals"][1])
     support_minor = max(minor_variance / model["g_perp"] ** 2, EIGENVALUE_FLOOR)
@@ -160,18 +135,14 @@ def sampled_ourmodel_metrics(episode: dict[str, Any], model: dict[str, float], s
     pred = np.einsum("...i,ij,...j->...", delta, np.linalg.pinv(support_covariance), delta) <= N_SIGMA**2
     target = sample["target"]
     intersection = float(np.logical_and(pred, target).mean())
-    pred_area = float(pred.mean())
-    target_area = float(target.mean())
-    union = pred_area + target_area - intersection
-    dice_denominator = pred_area + target_area
+    pred_area, target_area = float(pred.mean()), float(target.mean())
+    union, dice_denominator = pred_area + target_area - intersection, pred_area + target_area
     return {"iou": intersection / union if union else 0.0, "dice": 2.0 * intersection / dice_denominator if dice_denominator else 0.0, "recall": intersection / target_area if target_area else 0.0, "precision": intersection / pred_area if pred_area else 0.0}
 def select_candidate(train_episodes: list[dict[str, Any]], candidates: list[dict[str, float]]) -> tuple[dict[str, float], list[dict[str, float]]]:
     samples = {episode["episode_key"]: sample_episode_pixels(episode) for episode in train_episodes}
     records = []
     for candidate in candidates:
-        rows = []
-        for episode in train_episodes:
-            rows.append({"patient_id": episode["patient_id"], "method": "our_model", **sampled_ourmodel_metrics(episode, candidate, samples[episode["episode_key"]])})
+        rows = [{"patient_id": ep["patient_id"], "method": "our_model", **sampled_ourmodel_metrics(ep, candidate, samples[ep["episode_key"]])} for ep in train_episodes]
         record = {**candidate, **{f"train_patient_mean_{metric}": patient_mean_metric(rows, "our_model", metric) for metric in METRICS}}
         records.append(record)
     records.sort(key=lambda r: (-r["train_patient_mean_iou"], -r["train_patient_mean_dice"], -r["g_perp"], -r["g_parallel"], abs(r["g_parallel"] - r["g_perp"])))
@@ -189,8 +160,7 @@ def summarize_results(rows: list[dict[str, Any]], rng: np.random.Generator) -> t
             by_patient: dict[str, list[float]] = {}
             for episode_key, method in list(by_key):
                 if method != "our_model" or (episode_key, baseline) not in by_key: continue
-                ours, base = by_key[(episode_key, "our_model")], by_key[(episode_key, baseline)]
-                by_patient.setdefault(str(ours["patient_id"]), []).append(float(ours[metric]) - float(base[metric]))
+                ours, base = by_key[(episode_key, "our_model")], by_key[(episode_key, baseline)]; by_patient.setdefault(str(ours["patient_id"]), []).append(float(ours[metric]) - float(base[metric]))
             contrasts[f"our_model_minus_{baseline}"][metric] = paired_difference_stats([float(np.mean(values)) for values in by_patient.values()], rng)
     return summary, contrasts
 def fold_summary_row(fold: dict[str, Any], selected: dict[str, float], train_records: list[dict[str, float]], heldout_rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -198,8 +168,7 @@ def fold_summary_row(fold: dict[str, Any], selected: dict[str, float], train_rec
     row = {"fold": fold["fold"], "train_patients": len(fold["train_patients"]), "test_patients": len(fold["test_patients"]), "train_episodes": fold["train_episode_count"], "test_episodes": fold["test_episode_count"], "g_parallel": float(selected["g_parallel"]), "g_perp": float(selected["g_perp"]), "rho_gate": float(selected["rho_gate"]), "train_patient_mean_iou": float(chosen["train_patient_mean_iou"]), "train_patient_mean_dice": float(chosen["train_patient_mean_dice"])}
     for method in METHODS:
         selected_rows = [r for r in heldout_rows if r["method"] == method]
-        for metric in ["iou", "dice"]:
-            row[f"heldout_{method}_{metric}"] = float(np.mean([r[metric] for r in selected_rows]))
+        for metric in ["iou", "dice"]: row[f"heldout_{method}_{metric}"] = float(np.mean([r[metric] for r in selected_rows]))
     return row
 def modal_selected_model(fold_table: list[dict[str, Any]]) -> dict[str, Any]:
     counts = Counter((float(row["g_parallel"]), float(row["g_perp"])) for row in fold_table)
@@ -210,28 +179,21 @@ def main() -> None:
     loader = ReflacxLoader(); loader.load_jsons()
     episodes = build_episodes(loader)
     folds, candidates = make_patient_folds(episodes, rng), candidate_grid()
-    rows, diagnostics, fold_table, fold_summaries = [], [], [], []
+    rows, diagnostics, fold_table = [], [], []
     for fold in folds:
-        train_episodes = [ep for ep in episodes if str(ep["patient_id"]) in fold["train_patients"]]
-        test_episodes = [ep for ep in episodes if str(ep["patient_id"]) in fold["test_patients"]]
-        selected, train_records = select_candidate(train_episodes, candidates)
-        heldout_rows = []
+        train_episodes = [ep for ep in episodes if str(ep["patient_id"]) in fold["train_patients"]]; test_episodes = [ep for ep in episodes if str(ep["patient_id"]) in fold["test_patients"]]
+        selected, train_records = select_candidate(train_episodes, candidates); heldout_rows = []
         for episode in test_episodes:
-            episode_rows, diagnostic = evaluate_episode(episode, selected, METHODS, fold["fold"])
-            heldout_rows.extend(episode_rows); diagnostics.append(diagnostic)
-        rows.extend(heldout_rows)
-        fold_table.append(fold_summary_row(fold, selected, train_records, heldout_rows))
-        fold_summaries.append({"fold": fold["fold"], "train_patients": len(fold["train_patients"]), "test_patients": len(fold["test_patients"]), "train_episodes": fold["train_episode_count"], "test_episodes": fold["test_episode_count"]})
+            episode_rows, diagnostic = evaluate_episode(episode, selected, METHODS, fold["fold"]); heldout_rows.extend(episode_rows); diagnostics.append(diagnostic)
+        rows.extend(heldout_rows); fold_table.append(fold_summary_row(fold, selected, train_records, heldout_rows))
     expected = {ep["episode_key"] for ep in episodes}
     for method in METHODS:
         keys = {row["episode_key"] for row in rows if row["method"] == method}
         if keys != expected: raise AssertionError(f"Held-out rows for {method} do not cover every episode exactly once")
-    summary, contrasts = summarize_results(rows, rng)
-    selected_model = modal_selected_model(fold_table)
+    summary, contrasts = summarize_results(rows, rng); selected_model = modal_selected_model(fold_table)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    result = {"config": {"seed": RANDOM_SEED, "n_folds": N_FOLDS, "min_fixations": MIN_FIXATIONS, "n_sigma": N_SIGMA, "our_model": OUR_MODEL, "candidate_grid": candidates, "selection_rule": "max sampled train patient-mean IoU, then Dice, larger g_perp, larger g_parallel, smaller axis gap", "training_selection_uses_sampled_pixels": True, "tuning_sample_pixels_per_episode": TUNING_SAMPLE_PIXELS, "heldout_metrics_are_exact": True, "foveal_radius_px": FOVEAL_RADIUS_PX}, "counts": {"eligible_episodes": len(episodes), "patients": len({ep["patient_id"] for ep in episodes}), "heldout_rows": len(rows)}, "folds": fold_summaries, "fold_table": fold_table, "selected_model": selected_model, "summary": summary, "contrasts": contrasts, "rows": rows}
+    result = {"config": {"seed": RANDOM_SEED, "n_folds": N_FOLDS, "min_fixations": MIN_FIXATIONS, "n_sigma": N_SIGMA, "our_model": OUR_MODEL, "candidate_grid": candidates, "selection_rule": "max sampled train patient-mean IoU, then Dice, larger g_perp, larger g_parallel, smaller axis gap", "training_selection_uses_sampled_pixels": True, "tuning_sample_pixels_per_episode": TUNING_SAMPLE_PIXELS, "heldout_metrics_are_exact": True, "foveal_radius_px": FOVEAL_RADIUS_PX}, "counts": {"eligible_episodes": len(episodes), "patients": len({ep["patient_id"] for ep in episodes}), "heldout_rows": len(rows)}, "folds": [{"fold": f["fold"], "train_patients": len(f["train_patients"]), "test_patients": len(f["test_patients"]), "train_episodes": f["train_episode_count"], "test_episodes": f["test_episode_count"]} for f in folds], "fold_table": fold_table, "selected_model": selected_model, "summary": summary, "contrasts": contrasts, "rows": rows}
     (OUT_DIR / "object_recovery.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     (OUT_DIR / "object_recovery_table.json").write_text(json.dumps({"summary": summary, "contrasts": contrasts, "fold_table": fold_table, "selected_model": selected_model}, indent=2), encoding="utf-8")
     (OUT_DIR / "object_recovery_examples.json").write_text(json.dumps({"examples": sorted(diagnostics, key=lambda d: d["method_metrics"]["our_model"]["iou"], reverse=True)[:12]}, indent=2), encoding="utf-8")
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
